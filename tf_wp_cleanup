@@ -73,8 +73,8 @@ __version__ = "2.1.0"
 SELF = os.path.realpath(__file__)
 BASE_DIR = os.path.dirname(SELF)
 TOOL = "tf_wp_cleanup" if os.path.basename(sys.argv[0]) == "tf_wp_cleanup" else "python3 " + shlex.quote(SELF)
-QBASE = os.path.join(BASE_DIR, "wp_quarantine")      # moved/replaced files go here (never deleted automatically)
-REPORTS_DIR = os.path.join(BASE_DIR, "wp_reports")   # run logs and findings reports go here
+QBASE = os.path.join(BASE_DIR, "tf_wp_quarantine")      # moved/replaced files go here (never deleted automatically)
+REPORTS_DIR = os.path.join(BASE_DIR, "tf_wp_reports")   # run logs and findings reports go here
 WEB_DIR_NAMES = {"public_html", "www", "htdocs", "html", "public"}
 DENY_HTACCESS = ("# Keep this folder private\n<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n"
                  "<IfModule !mod_authz_core.c>\nDeny from all\n</IfModule>\n")
@@ -1194,9 +1194,9 @@ def main():
     ap.add_argument("--no-cjk", action="store_true", help="do not flag Chinese/Japanese/Korean characters")
     ap.add_argument("--no-network", action="store_true", help="skip official checksum verification")
     ap.add_argument("--quarantine-dir", default=None,
-                    help="where moved files go (default: wp_quarantine/ next to this script)")
+                    help="where moved files go (default: tf_wp_quarantine/ next to this script)")
     ap.add_argument("--reports-dir", default=None,
-                    help="where logs/reports go (default: wp_reports/ next to this script)")
+                    help="where logs/reports go (default: tf_wp_reports/ next to this script)")
     ap.add_argument("--version", action="version", version="tf_wp_cleanup " + __version__)
     args = ap.parse_args()
 
@@ -1215,7 +1215,7 @@ def main():
     ensure_private_dir(QBASE)
     if any(part in WEB_DIR_NAMES for part in BASE_DIR.split(os.sep)):
         say("[!] This tool lives inside a web-accessible folder (%s)." % BASE_DIR)
-        say("    Move it (and its wp_quarantine/wp_reports folders) outside public_html, e.g. ~/tf_tools/.")
+        say("    Move it (and its tf_wp_quarantine/tf_wp_reports folders) outside public_html, e.g. ~/tf_tools/.")
     if not args.list_quarantine:
         try:
             log_path = os.path.join(reports_dir, "run_%s.log" % ts)
