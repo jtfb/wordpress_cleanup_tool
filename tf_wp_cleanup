@@ -1,0 +1,1358 @@
+#!/usr/bin/env python3
+"""
+tf_wp_cleanup.py - find, clean and RECOVER hacked WordPress sites on shared hosting (cPanel).
+
+Works on the folder you are standing in (and below). Run it from the site's root
+folder (the one with wp-config.php, wp-admin, wp-includes). Keep the script in your
+HOME folder (not public_html) and call it as ~/tf_wp_cleanup.py.
+
+ONE-COMMAND RECOVERY (take a cPanel backup first):
+    cd ~/public_html/site1
+    tf_wp_cleanup --recover
+  = restore missing/modified core + plugin files from official ZIPs
+  + quarantine PHP in uploads / unknown PHP in core folders
+  + strip malicious auto_prepend_file lines
+  + rewrite .htaccess with the standard WordPress block (--htaccess)
+  + fix file permissions (777/666 cause 500 errors)
+  + explain what is still broken (reads your error_log)
+
+STEP BY STEP
+    tf_wp_cleanup                 scan only, changes nothing (dry run)
+    tf_wp_cleanup --fix           apply the safe fixes from the scan
+    tf_wp_cleanup --fix --aggressive   also quarantine unknown plugin PHP + signature hits
+    tf_wp_cleanup --diagnose      read error logs, explain the 500 error
+Recovery tools (each acts immediately and is reversible):
+    --htaccess                  rewrite .htaccess with the standard WordPress block (old one backed up)
+                                (also works as --reset-htaccess; --rewrite-base /sub/ for subfolder sites, --keep-php-handler keeps cPanel PHP version lines)
+    --rebuild-config            rebuild a clean wp-config.php from the old settings (--db-name/--db-user/
+                                --db-password/--db-host/--table-prefix if the old one is gone)
+    --debug on|off              log PHP errors to wp-content/debug.log, then read them with --diagnose
+    --check-admin               read-only: check admin roles, list users (flags accounts made recently)
+    --fix-admin USER            give USER (login or ID) the administrator role; rebuilds broken roles
+    --fix-perms                 dirs 755, files 644, wp-config.php 600
+    --disable-all-plugins       rename wp-content/plugins -> plugins.disabled   (--enable-all-plugins undoes)
+    --disable-plugin SLUG       rename one plugin folder to SLUG.disabled (rename back to undo)
+    --disable-theme SLUG        same for a theme
+    --quarantine-file FILE      move one file to quarantine (repeatable)
+    --strip-conf FILE           remove auto_prepend/append_file lines from one .user.ini/php.ini/.htaccess
+Undo anything the script moved/replaced (nothing is ever deleted):
+    --exclude PATH              (any mode) ignore a folder such as an old backup: --exclude bkp
+    --list-quarantine
+    --purge-quarantine DAYS            permanently delete quarantine runs older than DAYS (asks first; --yes for cron)
+    --undo-file /full/path/to/file     put one file back as it was
+    --undo-all [RUN]                   put back everything from a run (this also brings malware back!)
+"""
+import argparse
+import hashlib
+import io
+import glob
+import json
+import os
+import random
+import re
+import shlex
+import shutil
+import string
+import subprocess
+import sys
+import time
+import urllib.request
+import zipfile
+
+UA = {"User-Agent": "tf-wp-cleanup/2.1"}
+PHP_EXT = {".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".phps", ".phar", ".inc"}
+CODE_EXT = PHP_EXT | {".js", ".html", ".htm"}
+IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".ico", ".webp", ".bmp", ".txt"}
+CONF_NAMES = {".htaccess", ".user.ini", "php.ini"}
+SKIP_DIRS = {".git", "node_modules"}
+IGNORE_NAMES = {"error_log", "php_errorlog", ".htaccess", ".DS_Store"}
+SKIP_MISSING = {"readme.html", "license.txt", "wp-config-sample.php"}
+MAX_SIZE = 3 * 1024 * 1024
+RANK = {"INFO": 0, "MED": 1, "HIGH": 2}
+__version__ = "2.1.0"
+SELF = os.path.realpath(__file__)
+BASE_DIR = os.path.dirname(SELF)
+TOOL = "tf_wp_cleanup" if os.path.basename(sys.argv[0]) == "tf_wp_cleanup" else "python3 " + shlex.quote(SELF)
+QBASE = os.path.join(BASE_DIR, "wp_quarantine")      # moved/replaced files go here (never deleted automatically)
+REPORTS_DIR = os.path.join(BASE_DIR, "wp_reports")   # run logs and findings reports go here
+WEB_DIR_NAMES = {"public_html", "www", "htdocs", "html", "public"}
+DENY_HTACCESS = ("# Keep this folder private\n<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n"
+                 "<IfModule !mod_authz_core.c>\nDeny from all\n</IfModule>\n")
+
+
+def say(*a):
+    print(*[x.replace("{TOOL}", TOOL) if isinstance(x, str) else x for x in a])
+
+
+def ensure_private_dir(path):
+    """Create a folder only the owner can use, and block web access in case it sits in a web folder."""
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+        ht = os.path.join(path, ".htaccess")
+        if not os.path.exists(ht):
+            with open(ht, "w") as fh:
+                fh.write(DENY_HTACCESS)
+    except OSError:
+        pass
+
+
+class Tee(object):
+    """Copy everything printed on screen into the run log."""
+    def __init__(self, stream, fh):
+        self.stream, self.fh = stream, fh
+
+    def write(self, s):
+        self.stream.write(s)
+        try:
+            self.fh.write(s)
+        except (OSError, ValueError):
+            pass
+
+    def flush(self):
+        self.stream.flush()
+        try:
+            self.fh.flush()
+        except (OSError, ValueError):
+            pass
+
+
+HIGH_SIGS = [(l, re.compile(r, re.I)) for l, r in [
+    ("eval of decoded payload",
+     r"\b(eval|assert)\s*\(\s*(@\s*)?(base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|rawurldecode|hex2bin|convert_uudecode)\s*\("),
+    ("eval/assert on request data", r"\b(eval|assert)\s*\(\s*(@\s*)?\$_(POST|GET|REQUEST|COOKIE|SERVER)"),
+    ("command exec on request data",
+     r"\b(system|shell_exec|passthru|exec|popen|proc_open|pcntl_exec)\s*\(\s*(@\s*)?\$_(POST|GET|REQUEST|COOKIE)"),
+    ("preg_replace /e modifier", r"preg_replace\s*\(\s*(['\"])[^'\"]{1,200}/[a-z]*e[a-z]*\1"),
+    ("known webshell", r"FilesMan|c99shell|r57shell|b374k|IndoXploit|Web Shell by|WSO\s*\d?\.\d"),
+    ("gzinflate(base64_decode())", r"gzinflate\s*\(\s*base64_decode"),
+    ("huge base64 blob decoded", r"base64_decode\s*\(\s*['\"][A-Za-z0-9+/=]{300,}['\"]"),
+]]
+MED_PHP = [(l, re.compile(r, re.I)) for l, r in [
+    ("eval()", r"\beval\s*\("),
+    ("create_function()", r"\bcreate_function\s*\("),
+    ("long hex-escaped string", r"(\\x[0-9a-f]{2}){25,}"),
+    ("file write of request data", r"file_put_contents\s*\([^;]{0,100}\$_(POST|GET|REQUEST)"),
+    ("str_rot13", r"\bstr_rot13\s*\("),
+]]
+MED_WEB = [(l, re.compile(r, re.I)) for l, r in [
+    ("hidden iframe", r"<iframe[^>]{0,200}(width|height)\s*=\s*['\"]?[01]['\"]?[ >'\"]"),
+    ("document.write(unescape())", r"document\.write\s*\(\s*unescape"),
+    ("long fromCharCode list", r"String\.fromCharCode\((\s*\d+\s*,){20,}"),
+]]
+CONF_SIGS = [(l, re.compile(r, re.I)) for l, r in [
+    ("redirect to external site", r"RewriteRule\s+\S+\s+https?://(?!%\{HTTP_HOST)"),
+    ("odd AddHandler for php", r"AddHandler\s+\S*php\S*\s+\.(jpg|jpeg|png|gif|txt|ico)"),
+    ("eval/base64 in config", r"eval\(|base64_decode"),
+]]
+AUTO_RX = re.compile(r"^\s*(?:php_(?:admin_)?value\s+)?auto_(?:prepend|append)_file\s*[=\s]\s*(.*)$", re.I)
+CJK = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]{2,}")
+FATAL_RX = re.compile(r"PHP (Fatal error|Parse error)[^\n]*? in (/[^\s:]+\.php)", re.I)
+REQ_RX = re.compile(r"Failed opening required '([^']+)'")
+DEFAULT_HTACCESS = """# BEGIN WordPress
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteBase {base}
+RewriteRule ^index.php$ - [L]
+RewriteCond %{{REQUEST_FILENAME}} !-f
+RewriteCond %{{REQUEST_FILENAME}} !-d
+RewriteRule . {base}index.php [L]
+</IfModule>
+# END WordPress
+"""
+
+
+# ---------------------------------------------------------------- helpers
+def http_get(url, timeout=120):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
+def md5_bytes(b):
+    return hashlib.md5(b).hexdigest()
+
+
+def md5_file(p):
+    h = hashlib.md5()
+    with open(p, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def snippet(s):
+    return re.sub(r"\s+", " ", s)[:80]
+
+
+def action_rank(a):
+    if a is None:
+        return 0
+    if isinstance(a, tuple):
+        return 3
+    return {"aggr": 1, "quarantine": 2}[a]
+
+
+def add(findings, path, level, reason, action=None):
+    f = findings.setdefault(path, {"level": "INFO", "reasons": [], "action": None})
+    if RANK[level] > RANK[f["level"]]:
+        f["level"] = level
+    if reason not in f["reasons"]:
+        f["reasons"].append(reason)
+    if action_rank(action) > action_rank(f["action"]):
+        f["action"] = action
+
+
+def ext_of(name):
+    return os.path.splitext(name)[1].lower()
+
+
+EXCLUDE = []
+
+
+def excluded(path):
+    p = os.path.abspath(path)
+    return any(p == e or p.startswith(e + os.sep) for e in EXCLUDE)
+
+
+def walk(root, prune=()):
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and os.path.join(d, x) not in prune
+                   and not excluded(os.path.join(d, x))]
+        for fn in files:
+            yield os.path.join(d, fn), fn
+
+
+def read_text(p, limit=None):
+    try:
+        with open(p, "rb") as fh:
+            return fh.read(limit).decode("utf-8", "ignore") if limit else fh.read().decode("utf-8", "ignore")
+    except OSError:
+        return ""
+
+
+def conf_prepends(path):
+    """auto_prepend/append_file values in a config file (ignores empty/'none')."""
+    vals = []
+    for line in read_text(path).splitlines():
+        m = AUTO_RX.match(line)
+        if m:
+            v = m.group(1).strip().strip("\"' ")
+            if v and v.lower() != "none":
+                vals.append(v)
+    return vals
+
+
+# ---------------------------------------------------------------- WordPress info
+def find_installs(roots):
+    found = []
+    for r in roots:
+        for d, dirs, _ in os.walk(r):
+            if os.path.isfile(os.path.join(d, "wp-includes", "version.php")):
+                found.append(os.path.abspath(d))
+            dirs[:] = [x for x in dirs if x not in SKIP_DIRS | {"wp-content", "wp-admin", "wp-includes"}
+                       and not excluded(os.path.join(d, x))]
+    return sorted(set(found))
+
+
+def wp_version(root):
+    txt = read_text(os.path.join(root, "wp-includes", "version.php"))
+    v = re.search(r"\$wp_version\s*=\s*'([^']+)'", txt)
+    l = re.search(r"\$wp_local_package\s*=\s*'([^']+)'", txt)
+    return (v.group(1) if v else None), (l.group(1) if l else "en_US")
+
+
+def core_checksums(ver, loc):
+    for l in dict.fromkeys([loc, "en_US"]):
+        raw = http_get("https://api.wordpress.org/core/checksums/1.0/?version=%s&locale=%s" % (ver, l))
+        if not raw:
+            continue
+        try:
+            c = json.loads(raw.decode()).get("checksums")
+        except ValueError:
+            continue
+        if isinstance(c, dict):
+            if isinstance(c.get(ver), dict):
+                c = c[ver]
+            if c:
+                return c
+    return None
+
+
+def plugin_version(pdir):
+    try:
+        for fn in os.listdir(pdir):
+            if fn.endswith(".php"):
+                m = re.search(r"^[ \t/*#@]*Version:\s*([^\s]+)", read_text(os.path.join(pdir, fn), 8192),
+                              re.I | re.M)
+                if m:
+                    return m.group(1).strip()
+    except OSError:
+        pass
+    return None
+
+
+def plugin_checksums(slug, ver):
+    raw = http_get("https://downloads.wordpress.org/plugin-checksums/%s/%s.json" % (slug, ver), 60)
+    if not raw:
+        return None
+    try:
+        files = json.loads(raw.decode()).get("files")
+    except ValueError:
+        return None
+    return files if isinstance(files, dict) else None
+
+
+# ---------------------------------------------------------------- verification passes
+def verify_core(root, findings, verified, use_net):
+    ver, loc = wp_version(root)
+    if not (ver and use_net):
+        add(findings, root, "INFO", "core not verified (no version/network)")
+        return
+    cks = core_checksums(ver, loc)
+    if not cks:
+        add(findings, root, "INFO", "no official checksums for WP %s (%s)" % (ver, loc))
+        return
+    say("  core %s (%s): checking %d files" % (ver, loc, len(cks)))
+    for rel, md5 in cks.items():
+        if rel.startswith("wp-content/"):
+            continue
+        p = os.path.join(root, rel)
+        act = ("restore_core", ver, loc, rel, md5)
+        if not os.path.isfile(p):
+            if rel not in SKIP_MISSING:
+                add(findings, p, "HIGH", "core file MISSING", act)
+        elif md5_file(p) == md5:
+            verified.add(p)
+        else:
+            add(findings, p, "HIGH", "core file modified", act)
+    for sub in ("wp-admin", "wp-includes"):
+        for p, fn in walk(os.path.join(root, sub)):
+            rel = os.path.relpath(p, root).replace(os.sep, "/")
+            if rel not in cks and fn not in IGNORE_NAMES and ext_of(fn) in PHP_EXT:
+                add(findings, p, "HIGH", "unknown PHP file in core folder", "quarantine")
+    try:
+        for fn in os.listdir(root):
+            p = os.path.join(root, fn)
+            if (os.path.isfile(p) and ext_of(fn) in PHP_EXT and fn not in cks and fn != "wp-config.php"):
+                add(findings, p, "MED", "unknown PHP file at site root (review; --aggressive quarantines it)", "aggr")
+    except OSError:
+        pass
+
+
+def verify_plugins(root, findings, verified, use_net):
+    pdir = os.path.join(root, "wp-content", "plugins")
+    if not (use_net and os.path.isdir(pdir)):
+        return
+    for slug in sorted(os.listdir(pdir)):
+        d = os.path.join(pdir, slug)
+        if not os.path.isdir(d) or slug.endswith(".disabled"):
+            continue
+        ver = plugin_version(d)
+        files = plugin_checksums(slug, ver) if ver else None
+        if not files:
+            add(findings, d, "INFO", "plugin '%s' not verifiable (premium/custom/unknown version)" % slug)
+            continue
+        for rel, info in files.items():
+            p = os.path.join(d, rel)
+            md5s = info.get("md5", [])
+            md5s = [md5s] if isinstance(md5s, str) else list(md5s)
+            act = ("restore_plugin", slug, ver, rel, md5s)
+            if not os.path.isfile(p):
+                add(findings, p, "HIGH", "plugin file MISSING (%s %s)" % (slug, ver), act)
+            elif md5_file(p) in md5s:
+                verified.add(p)
+            else:
+                add(findings, p, "HIGH", "plugin file modified (%s %s)" % (slug, ver), act)
+        for p, fn in walk(d):
+            rel = os.path.relpath(p, d).replace(os.sep, "/")
+            if rel not in files and ext_of(fn) in PHP_EXT and fn not in IGNORE_NAMES:
+                add(findings, p, "MED", "PHP file not part of plugin '%s' (review)" % slug, "aggr")
+
+
+def review_wp_content(root, findings):
+    """mu-plugins and drop-ins are favourite hiding places: list them for review."""
+    wc = os.path.join(root, "wp-content")
+    mu = os.path.join(wc, "mu-plugins")
+    if os.path.isdir(mu):
+        for p, fn in walk(mu):
+            if ext_of(fn) in PHP_EXT:
+                add(findings, p, "MED", "must-use plugin (loads on every request; confirm you know it)")
+    for fn in ("advanced-cache.php", "object-cache.php", "db.php", "db-error.php", "maintenance.php"):
+        p = os.path.join(wc, fn)
+        if os.path.isfile(p):
+            add(findings, p, "MED", "WordPress drop-in (confirm it belongs to a plugin you use)")
+    try:
+        for fn in os.listdir(wc):
+            p = os.path.join(wc, fn)
+            if os.path.isfile(p) and ext_of(fn) in PHP_EXT and fn not in (
+                    "index.php", "advanced-cache.php", "object-cache.php", "db.php", "db-error.php", "maintenance.php"):
+                add(findings, p, "MED", "unexpected PHP file directly in wp-content (review)")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- generic scan
+def scan_file(path, name, in_uploads, cjk):
+    hits = []
+    ext = ext_of(name)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return hits
+    is_php = ext in PHP_EXT
+    if in_uploads and is_php and not (name == "index.php" and size < 200):
+        hits.append(("HIGH", "PHP file inside uploads", "quarantine"))
+    img = ext in IMG_EXT
+    if not (ext in CODE_EXT or name in CONF_NAMES or img):
+        return hits
+    if size > (1000000 if img else MAX_SIZE):
+        return hits
+    text = read_text(path)
+    if img:
+        if "<?php" in text.lower():
+            hits.append(("HIGH", "PHP code hidden in %s file" % ext, "quarantine" if in_uploads else "aggr"))
+        return hits
+    if name in CONF_NAMES:
+        bad = [v for v in conf_prepends(path) if "wordfence-waf" not in v]
+        if bad:
+            hits.append(("HIGH", "auto_prepend/append_file -> %s" % ", ".join(bad)[:80], ("strip_conf",)))
+        for label, rx in CONF_SIGS:
+            m = rx.search(text)
+            if m:
+                hits.append(("MED", "%s: %s (review; --reset-htaccess replaces it)" % (label, snippet(m.group(0))), None))
+        return hits
+    for label, rx in HIGH_SIGS:
+        m = rx.search(text)
+        if m:
+            hits.append(("HIGH", "%s: %s" % (label, snippet(m.group(0))), "aggr"))
+    if is_php:
+        for label, rx in MED_PHP:
+            if rx.search(text):
+                hits.append(("MED", label, None))
+        if any(len(line) > 5000 for line in text.split("\n")):
+            hits.append(("MED", "very long line (possible obfuscation)", None))
+    if ext in (".php", ".js", ".html", ".htm"):
+        for label, rx in MED_WEB:
+            if rx.search(text):
+                hits.append(("MED", label, None))
+    if cjk:
+        m = CJK.search(text)
+        if m:
+            hits.append(("MED", "CJK characters: " + m.group(0)[:20], None))
+    return hits
+
+
+def generic_scan(root, all_roots, verified, findings, args):
+    prune = set(r for r in all_roots if r != root)
+    cutoff = time.time() - args.days * 86400 if args.days else None
+    n = 0
+    for p, fn in walk(root, prune):
+        if p in verified or os.path.islink(p):
+            continue
+        n += 1
+        in_up = (os.sep + "wp-content" + os.sep + "uploads" + os.sep) in p
+        for level, reason, action in scan_file(p, fn, in_up, not args.no_cjk):
+            if fn == "wp-config.php" and action:
+                action, reason = None, reason + " (wp-config.php is never moved automatically: use --rebuild-config)"
+            add(findings, p, level, reason, action)
+        if cutoff and ext_of(fn) in PHP_EXT:
+            try:
+                if os.path.getmtime(p) > cutoff:
+                    add(findings, p, "INFO", "modified in the last %d days" % args.days)
+            except OSError:
+                pass
+    say("  scanned %d files" % n)
+
+
+# ---------------------------------------------------------------- fixing
+def quarantine(path, qroot):
+    dest = os.path.join(qroot, path.lstrip("/"))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.move(path, dest)
+    os.chmod(dest, 0o600)
+
+
+def backup(path, qroot):
+    if not os.path.isfile(path):
+        return
+    dest = os.path.join(qroot, "replaced", path.lstrip("/"))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(path, dest)
+    os.chmod(dest, 0o600)
+
+
+def write_atomic(path, data, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".wpclean.tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def get_zip(key, urls, cache):
+    if key not in cache:
+        cache[key] = None
+        for u in urls:
+            data = http_get(u, 300)
+            if data:
+                cache[key] = data
+                break
+    return cache[key]
+
+
+def restore(path, act, cache, qroot):
+    if act[0] == "restore_core":
+        _, ver, loc, rel, md5 = act
+        urls = []
+        if loc != "en_US":
+            urls.append("https://downloads.wordpress.org/release/%s/wordpress-%s.zip" % (loc, ver))
+        urls.append("https://wordpress.org/wordpress-%s.zip" % ver)
+        z = get_zip(("core", ver, loc), urls, cache)
+        member, expected = "wordpress/" + rel, [md5]
+    else:
+        _, slug, ver, rel, md5s = act
+        z = get_zip(("plugin", slug, ver),
+                    ["https://downloads.wordpress.org/plugin/%s.%s.zip" % (slug, ver)], cache)
+        member, expected = slug + "/" + rel, md5s
+    if not z:
+        raise RuntimeError("could not download official ZIP")
+    with zipfile.ZipFile(io.BytesIO(z)) as zf:
+        data = zf.read(member)
+    if md5_bytes(data) not in expected:
+        raise RuntimeError("ZIP copy does not match official checksum; skipped")
+    backup(path, qroot)
+    write_atomic(path, data)
+
+
+def strip_conf_lines(path, qroot):
+    lines = read_text(path).splitlines(True)
+    keep, removed = [], 0
+    for line in lines:
+        m = AUTO_RX.match(line)
+        v = m.group(1).strip().strip("\"' ") if m else ""
+        if m and v and v.lower() != "none" and "wordfence-waf" not in v:
+            removed += 1
+        else:
+            keep.append(line)
+    if removed:
+        backup(path, qroot)
+        write_atomic(path, "".join(keep).encode("utf-8"))
+    return removed
+
+
+def apply_fixes(findings, args, qroot):
+    cache, done, failed = {}, 0, 0
+    for path, f in sorted(findings.items()):
+        a = f["action"]
+        if isinstance(a, tuple):
+            do = a
+        elif a == "quarantine" or (a == "aggr" and args.aggressive):
+            do = ("quarantine",)
+        else:
+            continue
+        if os.path.basename(path) == "wp-config.php" and do[0] == "quarantine":
+            continue
+        label = {"restore_core": "restore", "restore_plugin": "restore",
+                 "strip_conf": "strip auto_prepend lines in", "quarantine": "quarantine"}[do[0]]
+        if not args.fix:
+            say("  [dry-run] would %s: %s" % (label, path))
+            continue
+        try:
+            if do[0] == "quarantine":
+                quarantine(path, qroot)
+            elif do[0] == "strip_conf":
+                strip_conf_lines(path, qroot)
+            else:
+                restore(path, do, cache, qroot)
+            say("  %s: %s" % (label, path))
+            done += 1
+        except Exception as e:
+            say("  FAILED %s %s: %s" % (label, path, e))
+            failed += 1
+    return done, failed
+
+
+# ---------------------------------------------------------------- recovery tools
+CPANEL_BLOCK = re.compile(r"# php -- BEGIN cPanel-generated handler.*?# php -- END cPanel-generated handler, do not edit[ \t]*\n?", re.S)
+
+
+def reset_htaccess(root, qroot, base="/", keep_php=False):
+    p = os.path.join(root, ".htaccess")
+    old = read_text(p) if os.path.isfile(p) else ""
+    keep = ""
+    if keep_php:
+        m = CPANEL_BLOCK.search(old)
+        if m and not re.search(r"eval|base64|auto_prepend|https?:|\.(jpe?g|png|gif|txt|ico)\b", m.group(0), re.I):
+            keep = m.group(0).rstrip("\n") + "\n\n"
+    base = "/" + base.strip("/") + "/" if base.strip("/") else "/"
+    backup(p, qroot)
+    write_atomic(p, (keep + DEFAULT_HTACCESS.format(base=base)).encode())
+    say("  .htaccess rewritten (RewriteBase %s)%s: %s  (old copy in %s/replaced)" % (
+        base, " + kept cPanel PHP-version block" if keep else "", p, qroot))
+
+
+def fix_perms(root):
+    n = 0
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and not excluded(os.path.join(d, x))]
+        items = [(os.path.join(d, x), 0o755) for x in dirs] + [
+            (os.path.join(d, x), 0o600 if (x == "wp-config.php" and d == root) else 0o644) for x in files]
+        for p, want in items:
+            try:
+                if os.path.islink(p):
+                    continue
+                if (os.stat(p).st_mode & 0o777) != want:
+                    os.chmod(p, want)
+                    n += 1
+            except OSError:
+                pass
+    say("  permissions fixed on %d items under %s" % (n, root))
+
+
+def disable_all_plugins(root):
+    p = os.path.join(root, "wp-content", "plugins")
+    d = p + ".disabled"
+    if os.path.exists(d):
+        say("  plugins already disabled (%s exists)" % d)
+    elif os.path.isdir(p):
+        os.rename(p, d)
+        os.mkdir(p)
+        os.chmod(p, 0o755)
+        say("  all plugins disabled: %s -> %s" % (p, d))
+    else:
+        say("  no plugins folder in %s" % root)
+
+
+def enable_all_plugins(root):
+    p = os.path.join(root, "wp-content", "plugins")
+    d = p + ".disabled"
+    if not os.path.isdir(d):
+        say("  nothing to enable (no %s)" % d)
+        return
+    if os.path.isdir(p):
+        if [x for x in os.listdir(p) if x != "index.php"]:
+            say("  %s has content; not overwriting. Move it away first." % p)
+            return
+        shutil.rmtree(p)
+    os.rename(d, p)
+    say("  plugins folder restored: %s (re-activate plugins in wp-admin)" % p)
+
+
+def disable_item(root, kind, slug):
+    src = os.path.join(root, "wp-content", kind, os.path.basename(slug))
+    dst = src + ".disabled"
+    if not os.path.isdir(src):
+        say("  %s/%s not found in %s" % (kind, slug, root))
+    elif os.path.exists(dst):
+        say("  %s already exists" % dst)
+    else:
+        os.rename(src, dst)
+        say("  disabled: %s -> %s  (rename back to re-enable)" % (src, dst))
+
+
+# ---------------------------------------------------------------- quarantine browsing / undo
+def list_runs(custom=None):
+    if custom:
+        return [os.path.abspath(custom)]
+    if not os.path.isdir(QBASE):
+        return []
+    return sorted([os.path.join(QBASE, d) for d in os.listdir(QBASE)
+                   if os.path.isdir(os.path.join(QBASE, d))], reverse=True)
+
+
+def find_in_quarantine(path, runs):
+    for run in runs:
+        for sub in ("", "replaced"):
+            cand = os.path.join(run, sub, path.lstrip("/")) if sub else os.path.join(run, path.lstrip("/"))
+            if os.path.isfile(cand):
+                return cand, run, sub or "quarantined"
+    return None
+
+
+def run_files(run):
+    for d, _, files in os.walk(run):
+        for fn in files:
+            full = os.path.join(d, fn)
+            rel = os.path.relpath(full, run)
+            if rel.startswith("replaced" + os.sep):
+                rel = rel[len("replaced") + 1:]
+            yield full, "/" + rel
+
+
+def list_quarantine(runs):
+    if not runs:
+        say("No quarantine runs found in %s" % QBASE)
+    for run in runs:
+        files = list(run_files(run))
+        say("%s  (%d files)" % (run, len(files)))
+        for _, orig in files[:200]:
+            say("    %s" % orig)
+
+
+def dir_size(path):
+    total = 0
+    for d, _, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(d, fn))
+            except OSError:
+                pass
+    return total
+
+
+def purge_quarantine(days, assume_yes):
+    """Permanently delete quarantine runs older than N days (this is the ONLY place the tool deletes)."""
+    if days < 1:
+        say("DAYS must be 1 or more.")
+        return
+    cutoff = time.time() - days * 86400
+    old = []
+    for run in list_runs():
+        try:
+            t = time.mktime(time.strptime(os.path.basename(run), "%Y%m%d_%H%M%S"))
+        except ValueError:
+            t = os.path.getmtime(run)
+        if t < cutoff:
+            old.append(run)
+    if not old:
+        say("No quarantine runs older than %d days in %s" % (days, QBASE))
+        return
+    total = sum(dir_size(r) for r in old)
+    say("Quarantine runs older than %d days (%.1f MB):" % (days, total / 1048576.0))
+    for r in old:
+        say("    %s" % r)
+    if not assume_yes:
+        try:
+            ok = input("Delete these PERMANENTLY? Type YES: ").strip() == "YES"
+        except EOFError:
+            ok = False
+        if not ok:
+            say("Cancelled. Nothing deleted.")
+            return
+    for r in old:
+        shutil.rmtree(r, ignore_errors=True)
+        say("  deleted %s" % r)
+
+
+def undo_file(path, runs):
+    path = os.path.abspath(path)
+    hit = find_in_quarantine(path, runs)
+    if not hit:
+        say("No quarantined/backup copy of %s" % path)
+        return
+    cand, run, kind = hit
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    shutil.copy2(cand, path)
+    os.chmod(path, 0o644)
+    say("Restored %s from %s (%s). Copy kept in quarantine." % (path, run, kind))
+
+
+def undo_all(arg, runs):
+    if arg == "latest":
+        run = runs[0] if runs else None
+    else:
+        run = arg if os.path.isdir(arg) else os.path.join(QBASE, arg)
+    if not run or not os.path.isdir(run):
+        say("Run folder not found.")
+        return
+    files = list(run_files(run))
+    say("This will put back %d files from %s - INCLUDING any malware that was quarantined." % (len(files), run))
+    if input("Type YES to continue: ").strip() != "YES":
+        say("Cancelled.")
+        return
+    for full, orig in files:
+        os.makedirs(os.path.dirname(orig), exist_ok=True)
+        shutil.copy2(full, orig)
+        os.chmod(orig, 0o644)
+        say("  restored %s" % orig)
+
+
+ADMIN_PHP = r'''<?php
+// Generated by tf_wp_cleanup.py - command line only, never reachable from the web.
+// All variables are prefixed tf_ so they can never collide with WordPress globals such as $wp.
+if (php_sapi_name() !== 'cli') { exit(1); }
+$tf_load  = $argv[1];
+$tf_who   = isset($argv[2]) ? $argv[2] : '';
+$tf_apply = (isset($argv[3]) && $argv[3] === 'apply');
+define('WP_USE_THEMES', false);
+register_shutdown_function(function () {
+    $tf_e = error_get_last();
+    if ($tf_e && in_array($tf_e['type'], array(E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_RECOVERABLE_ERROR), true)) {
+        echo "\nPHP FATAL: " . $tf_e['message'] . " in " . $tf_e['file'] . ":" . $tf_e['line'] . "\n";
+    }
+});
+$tf_empty = sys_get_temp_dir() . '/tf_noplugins_' . getmypid();
+@mkdir($tf_empty, 0700);
+define('WP_PLUGIN_DIR', $tf_empty);
+define('WPMU_PLUGIN_DIR', $tf_empty);
+register_shutdown_function(function () use ($tf_empty) { @rmdir($tf_empty); });
+echo "(plugins are skipped during this check so a broken plugin cannot stop it)\n";
+if (empty($_SERVER['HTTP_HOST'])) { $_SERVER['HTTP_HOST'] = 'localhost'; }
+require $tf_load;
+global $wpdb;
+echo "table prefix (wp-config.php): {$wpdb->prefix}\n";
+$tf_meta = $wpdb->prefix . 'usermeta';
+if ($wpdb->get_var("SHOW TABLES LIKE '" . esc_sql($wpdb->esc_like($tf_meta)) . "'") !== $tf_meta) {
+    echo "!! Table '$tf_meta' does not exist. Tables that end in usermeta: " .
+         implode(', ', $wpdb->get_col("SHOW TABLES LIKE '%usermeta'")) . "\n";
+    echo "   -> set \$table_prefix in wp-config.php to match one of them, then run again.\n";
+    exit(2);
+}
+$tf_admin = get_role('administrator');
+$tf_need  = array('edit_pages', 'edit_others_pages', 'publish_pages', 'manage_options', 'edit_users', 'install_plugins');
+$tf_ok = (bool) $tf_admin;
+if ($tf_admin) { foreach ($tf_need as $tf_c) { if (!$tf_admin->has_cap($tf_c)) { $tf_ok = false; } } }
+echo "administrator role definition: " . ($tf_ok ? "OK" : "BROKEN / MISSING") . "\n";
+if (!$tf_ok && $tf_apply) {
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    populate_roles();
+    wp_roles()->for_site();
+    $tf_admin = get_role('administrator');
+    echo "  roles rebuilt -> " . (($tf_admin && $tf_admin->has_cap('edit_pages')) ? "OK" : "STILL BROKEN") . "\n";
+}
+echo "Users:\n";
+foreach (get_users(array('number' => 200)) as $tf_u) {
+    $tf_new = (strtotime($tf_u->user_registered) > time() - 30 * 86400) ? '  <-- created in the last 30 days' : '';
+    printf("  ID %-4d %-22s %-32s roles=[%s]%s\n", $tf_u->ID, $tf_u->user_login, $tf_u->user_email, implode(',', $tf_u->roles), $tf_new);
+}
+if ($tf_who !== '' && $tf_apply) {
+    $tf_user = ctype_digit($tf_who) ? get_user_by('id', (int) $tf_who) : get_user_by('login', $tf_who);
+    if (!$tf_user) { echo "!! user '$tf_who' not found\n"; exit(3); }
+    $tf_user->set_role('administrator');
+    clean_user_cache($tf_user->ID);
+    $tf_user = get_user_by('id', $tf_user->ID);
+    printf("FIXED user %s (ID %d): roles=[%s] edit_pages=%s manage_options=%s install_plugins=%s\n",
+        $tf_user->user_login, $tf_user->ID, implode(',', $tf_user->roles),
+        user_can($tf_user, 'edit_pages') ? 'yes' : 'NO',
+        user_can($tf_user, 'manage_options') ? 'yes' : 'NO',
+        user_can($tf_user, 'install_plugins') ? 'yes' : 'NO');
+}
+'''
+
+
+def find_php():
+    cands = [shutil.which("php")] + sorted(glob.glob("/opt/cpanel/ea-php*/root/usr/bin/php"), reverse=True) + [
+        "/usr/local/bin/php", "/usr/bin/php"]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def admin_tool(root, who, apply_):
+    """Check (or repair) administrator permissions by loading WordPress itself from the command line."""
+    php = find_php()
+    if not php:
+        say("  php command-line not found; use the phpMyAdmin SQL method instead.")
+        return
+    wl = os.path.join(root, "wp-load.php")
+    if not os.path.isfile(wl):
+        say("  wp-load.php missing in %s (run --recover first)" % root)
+        return
+    script = os.path.expanduser("~/.tf_wpclean_admin_%d.php" % os.getpid())
+    try:
+        with open(script, "w") as fh:
+            fh.write(ADMIN_PHP)
+        os.chmod(script, 0o600)
+        r = subprocess.run([php, "-d", "display_errors=1", "-d", "error_reporting=1", script, wl, who or "",
+                            "apply" if apply_ else "check"], cwd=root, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=180)
+        out = r.stdout
+        if "<html" in out.lower() or "<body" in out.lower():
+            out = re.sub(r"<style.*?</style>", " ", out, flags=re.S | re.I)
+            out = re.sub(r"<[^>]+>", "\n", out)
+        out = "\n".join(l.strip() for l in out.splitlines() if l.strip())
+        say("\n".join("  " + l for l in out.splitlines()) if out else "  (no output)")
+        m = re.search(r"PHP FATAL:.* in (/\S+?\.php):\d+", out)
+        if m:
+            kind, slug = owner_of(m.group(1), root)
+            if kind:
+                flag = "--disable-plugin" if kind == "plugins" else "--disable-theme"
+                say("  -> the crash is inside %s '%s': {TOOL} %s %s" % (kind[:-1], slug, flag, slug))
+            else:
+                say("  -> the crash is in %s. If it is a core file run --fix; if it is wp-config.php run --rebuild-config." % m.group(1))
+        elif r.returncode not in (0, 2, 3):
+            say("  WordPress could not load even with plugins skipped: the theme or a core file is broken.")
+            say("  Try: --fix (restores core), then --disable-theme <active theme>.")
+    except Exception as e:
+        say("  failed: %s" % e)
+    finally:
+        try:
+            os.remove(script)
+        except OSError:
+            pass
+
+
+KEEP_DEFINES = ["WP_HOME", "WP_SITEURL", "WP_CACHE", "WP_MEMORY_LIMIT", "WP_MAX_MEMORY_LIMIT", "FS_METHOD",
+                "DISALLOW_FILE_EDIT", "FORCE_SSL_ADMIN", "WP_POST_REVISIONS", "AUTOMATIC_UPDATER_DISABLED",
+                "WP_AUTO_UPDATE_CORE", "COOKIE_DOMAIN", "WPLANG", "EMPTY_TRASH_DAYS"]
+SALT_NAMES = ["AUTH_KEY", "SECURE_AUTH_KEY", "LOGGED_IN_KEY", "NONCE_KEY",
+              "AUTH_SALT", "SECURE_AUTH_SALT", "LOGGED_IN_SALT", "NONCE_SALT"]
+PHP_STR = r"""(['"])((?:\\.|(?!\1).)*)\1"""
+
+
+def php_unquote(q, body):
+    if q == "'":
+        return re.sub(r"\\([\\'])", r"\1", body)
+    return re.sub(r'\\(["\\$])', r"\1", body)
+
+
+def php_quote(v):
+    return "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def parse_config(text):
+    """Pull the database settings and a few safe constants out of an (even infected) wp-config.php."""
+    vals = {}
+    for name in ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_CHARSET", "DB_COLLATE"):
+        m = re.search(r"define\s*\(\s*['\"]%s['\"]\s*,\s*" % name + PHP_STR, text)
+        if m:
+            vals[name] = php_unquote(m.group(1), m.group(2))
+    m = re.search(r"\$table_prefix\s*=\s*" + PHP_STR, text)
+    prefix = php_unquote(m.group(1), m.group(2)) if m else None
+    extras = []
+    for name in KEEP_DEFINES:
+        m = re.search(r"define\s*\(\s*['\"]%s['\"]\s*,\s*(true|false|TRUE|FALSE|\d+|'[^'\\\n]*'|\"[^\"\\\n$]*\")\s*\)" % name, text)
+        if m:
+            extras.append((name, m.group(1)))
+    handled = set(["DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_CHARSET", "DB_COLLATE", "ABSPATH"]) | \
+        set(SALT_NAMES) | set(n for n, _ in extras)
+    others = sorted(set(n for n in re.findall(r"define\s*\(\s*['\"](\w+)['\"]", text) if n not in handled))
+    return vals, prefix, extras, others
+
+
+def build_config(vals, prefix, extras):
+    rnd = random.SystemRandom()
+    chars = string.ascii_letters + string.digits + "!@#%^&*()-_=+[]{}<>~,.;:|/?"
+    salts = "\n".join("define( '%s', %s );" % (n, php_quote("".join(rnd.choice(chars) for _ in range(64))))
+                      for n in SALT_NAMES)
+    ex = "".join("define( '%s', %s );\n" % (n, v) for n, v in extras)
+    return ("<?php\n/** wp-config.php rebuilt by tf_wp_cleanup.py */\n"
+            "define( 'DB_NAME', %s );\ndefine( 'DB_USER', %s );\ndefine( 'DB_PASSWORD', %s );\n"
+            "define( 'DB_HOST', %s );\ndefine( 'DB_CHARSET', %s );\ndefine( 'DB_COLLATE', %s );\n\n"
+            "%s\n\n$table_prefix = %s;\n\n%sdefine( 'WP_DEBUG', false );\n\n"
+            "if ( ! defined( 'ABSPATH' ) ) {\n\tdefine( 'ABSPATH', __DIR__ . '/' );\n}\n"
+            "require_once ABSPATH . 'wp-settings.php';\n") % (
+        php_quote(vals["DB_NAME"]), php_quote(vals["DB_USER"]), php_quote(vals["DB_PASSWORD"]),
+        php_quote(vals.get("DB_HOST", "localhost")), php_quote(vals.get("DB_CHARSET", "utf8mb4")),
+        php_quote(vals.get("DB_COLLATE", "")), salts, php_quote(prefix), ex)
+
+
+def config_location(root):
+    """WordPress accepts wp-config.php in the site folder, or one level above it."""
+    here = os.path.join(root, "wp-config.php")
+    parent_dir = os.path.dirname(root)
+    above = os.path.join(parent_dir, "wp-config.php")
+    if os.path.isfile(here):
+        return here, "site folder"
+    if os.path.isfile(above) and not os.path.isfile(os.path.join(parent_dir, "wp-settings.php")):
+        return above, "parent folder"
+    return None, None
+
+
+def rebuild_config(root, args, qroot, runs):
+    existing, where = config_location(root)
+    target = existing or os.path.join(root, "wp-config.php")
+    src = existing
+    if not src:
+        hit = find_in_quarantine(target, runs)
+        if hit:
+            src = hit[0]
+            say("  wp-config.php is missing; reading the old settings from the quarantine copy: %s" % src)
+    vals, prefix, extras, others = ({}, None, [], [])
+    if src:
+        vals, prefix, extras, others = parse_config(read_text(src))
+    for k, a in (("DB_NAME", args.db_name), ("DB_USER", args.db_user),
+                 ("DB_PASSWORD", args.db_password), ("DB_HOST", args.db_host)):
+        if a is not None:
+            vals[k] = a
+    if args.table_prefix is not None:
+        prefix = args.table_prefix
+    missing = [k for k in ("DB_NAME", "DB_USER", "DB_PASSWORD") if k not in vals]
+    if prefix is None:
+        missing.append("table prefix")
+    if missing:
+        say("  Could not find: %s" % ", ".join(missing))
+        say("  Get them from cPanel > MySQL Databases (name/user) and phpMyAdmin (table prefix), then run e.g.:")
+        say("  {TOOL} --rebuild-config --db-name NAME --db-user USER "
+              "--db-password 'PASS' --table-prefix wp_")
+        return
+    if os.path.isfile(target):
+        backup(target, qroot)
+    write_atomic(target, build_config(vals, prefix, extras).encode("utf-8"), 0o600)
+    say("  wp-config.php rebuilt: %s" % target)
+    say("    database: %s   user: %s   host: %s   table prefix: %s" % (
+        vals["DB_NAME"], vals["DB_USER"], vals.get("DB_HOST", "localhost"), prefix))
+    if vals.get("DB_HOST", "localhost") not in ("localhost", "127.0.0.1"):
+        say("    [!] DB_HOST is not localhost - check this is really your database server (attackers change it).")
+    if extras:
+        say("    kept settings (check the values, esp. WP_HOME / WP_SITEURL): %s" % ", ".join("%s=%s" % (n, v) for n, v in extras))
+    if others:
+        say("    NOT copied (review if you need them): %s" % ", ".join(others))
+    say("    new security keys generated: everyone is logged out, which is what you want after an attack.")
+    if existing:
+        say("    old file backed up in %s/replaced" % qroot)
+
+
+def debug_mode(root, on, qroot):
+    """Turn WordPress error logging (wp-content/debug.log) on/off safely, without showing errors to visitors."""
+    cfg, _ = config_location(root)
+    if not cfg:
+        say("  wp-config.php not found; run --rebuild-config first")
+        return
+    text = read_text(cfg)
+    text = re.sub(r"\n?// [A-Z]{2,8}-DEBUG-BEGIN.*?// [A-Z]{2,8}-DEBUG-END\n?", "\n", text, flags=re.S)
+    text = re.sub(r"^// [A-Z]{2,8}-DISABLED: ", "", text, flags=re.M)
+    if on:
+        text = re.sub(r"^([ \t]*define\s*\(\s*['\"]WP_DEBUG(?:_LOG|_DISPLAY)?['\"].*)$", r"// TF-DISABLED: \1",
+                      text, flags=re.M)
+        block = ("// TF-DEBUG-BEGIN\ndefine( 'WP_DEBUG', true );\ndefine( 'WP_DEBUG_LOG', true );\n"
+                 "define( 'WP_DEBUG_DISPLAY', false );\n// TF-DEBUG-END\n")
+        m = re.search(r"^[^\n]*(That's all, stop editing|require_once[^\n]*wp-settings\.php)", text, re.M)
+        if not m:
+            say("  could not find where to insert the debug lines in %s; add WP_DEBUG_LOG by hand" % cfg)
+            return
+        text = text[:m.start()] + block + text[m.start():]
+    backup(cfg, qroot)
+    write_atomic(cfg, text.encode("utf-8"), 0o600)
+    if on:
+        say("  debug logging ON for %s  (errors go to wp-content/debug.log, visitors see nothing)" % root)
+        say("  Now reproduce the problem (open the page editor), then run: {TOOL} --diagnose")
+        say("  When finished: {TOOL} --debug off")
+    else:
+        say("  debug logging OFF for %s (original settings restored)" % root)
+
+
+# ---------------------------------------------------------------- diagnosis
+def tail(path, n=300000):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - n))
+            return fh.read().decode("utf-8", "ignore")
+    except OSError:
+        return ""
+
+
+def owner_of(path, root):
+    parts = os.path.relpath(path, root).replace(os.sep, "/").split("/")
+    if len(parts) >= 3 and parts[0] == "wp-content" and parts[1] in ("plugins", "themes"):
+        return parts[1], parts[2]
+    return None, None
+
+
+def ancestor_dirs(root):
+    home = os.path.expanduser("~").rstrip(os.sep)
+    out, d = [root], root
+    while d.startswith(home + os.sep):
+        d = os.path.dirname(d)
+        if d == home or d == os.sep:
+            break
+        out.append(d)
+    return out
+
+
+def diagnose(root, runs):
+    say("\n== DIAGNOSIS for %s" % root)
+    problems = 0
+    for need in ("index.php", os.path.join("wp-includes", "version.php")):
+        if not os.path.isfile(os.path.join(root, need)):
+            say("  [!] missing core file: %s  -> run with --recover to restore core files" % need)
+            problems += 1
+    cfg, where = config_location(root)
+    if cfg and where == "parent folder":
+        say("  wp-config.php is in the parent folder (valid WordPress setup): %s" % cfg)
+    elif not cfg:
+        mine = os.path.join(root, "wp-config.php")
+        hit = find_in_quarantine(mine, runs)
+        if hit:
+            say("  [!] wp-config.php is missing; this tool moved/replaced it earlier (%s: %s)" % (hit[2], hit[0]))
+        else:
+            say("  [!] wp-config.php not found in %s or its parent folder" % root)
+        say("      fix: {TOOL} --rebuild-config   (rebuilds a clean one from the old settings)")
+        problems += 1
+    # config files that load a missing file
+    for d in ancestor_dirs(root):
+        for name in sorted(CONF_NAMES):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                for v in conf_prepends(p):
+                    if "wordfence-waf" in v:
+                        continue
+                    state = "MISSING (every page will 500)" if not os.path.exists(v) else "exists (likely malware loader)"
+                    say("  [!] %s sets auto_prepend/append_file -> %s [%s]" % (p, v, state))
+                    say("      fix: {TOOL} --strip-conf %s" % p)
+                    problems += 1
+    # world-writable items
+    ww = 0
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and not excluded(os.path.join(d, x))]
+        for x in dirs + files:
+            try:
+                if os.stat(os.path.join(d, x)).st_mode & 0o002 and not os.path.islink(os.path.join(d, x)):
+                    ww += 1
+            except OSError:
+                pass
+    if ww:
+        say("  [!] %d world-writable files/folders (777/666) - hosts often answer these with 500 -> --fix-perms" % ww)
+        problems += 1
+    # error logs
+    logs = [os.path.join(root, "error_log"), os.path.join(root, "wp-admin", "error_log"),
+            os.path.join(root, "wp-content", "debug.log"), os.path.join(root, "wp-content", "error_log")]
+    for sub in ("plugins", "themes"):
+        base = os.path.join(root, "wp-content", sub)
+        if os.path.isdir(base):
+            logs += [os.path.join(base, x, "error_log") for x in os.listdir(base)]
+    seen, errors = set(), []
+    for lg in logs:
+        if not os.path.isfile(lg):
+            continue
+        for line in reversed(tail(lg).splitlines()):
+            m = FATAL_RX.search(line)
+            if not m:
+                continue
+            req = REQ_RX.search(line)
+            key = (m.group(2), req.group(1) if req else line[40:100])
+            if key in seen:
+                continue
+            seen.add(key)
+            errors.append((lg, line.strip(), m.group(2), req.group(1) if req else None))
+            if len(errors) >= 8:
+                break
+    if errors:
+        say("  Recent fatal errors (newest first):")
+    for lg, line, f, req in errors:
+        problems += 1
+        say("  [!] %s" % re.sub(r"\s*\(include_path='[^']*'\)", "", line)[:330])
+        for target in [x for x in (req, f) if x]:
+            hit = find_in_quarantine(target, runs)
+            if not os.path.exists(target):
+                if hit:
+                    say("      %s is missing; the script moved/replaced it earlier (%s)." % (target, hit[2]))
+                    say("      put it back (after checking it): {TOOL} --undo-file %s" % target)
+                else:
+                    say("      %s is missing -> reinstall the plugin/theme or run --recover" % target)
+        kind, slug = owner_of(f, root)
+        if kind:
+            flag = "--disable-plugin" if kind == "plugins" else "--disable-theme"
+            say("      belongs to %s '%s' -> try: {TOOL} %s %s" % (kind[:-1], slug, flag, slug))
+    if not errors:
+        say("  No fatal errors found in error logs (logs may be elsewhere: cPanel > Metrics > Errors).")
+    if not problems:
+        say("  Nothing obviously broken. If you still get a 500: --htaccess, then --disable-all-plugins.")
+    say("  Still 500? Order to try: --htaccess -> --fix-perms -> --disable-all-plugins -> --disable-theme <active theme>")
+
+
+# ---------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(description="Scan, clean and recover hacked WordPress sites")
+    ap.add_argument("roots", nargs="*", default=[os.getcwd()],
+                    help="folders to scan (default: the folder you are in right now)")
+    ap.add_argument("--recover", action="store_true", help="do everything needed to get the site back online")
+    ap.add_argument("--scan", action="store_true", help="run the malware scan even when using a recovery tool")
+    ap.add_argument("--fix", action="store_true", help="apply scan fixes (default is dry-run)")
+    ap.add_argument("--aggressive", action="store_true",
+                    help="also quarantine unknown PHP in plugins and files with high-confidence signatures")
+    ap.add_argument("--diagnose", action="store_true", help="read error logs and explain the 500 error")
+    ap.add_argument("--htaccess", "--reset-htaccess", dest="reset_htaccess", action="store_true",
+                    help="rewrite .htaccess with the standard WordPress block (RewriteBase /)")
+    ap.add_argument("--rewrite-base", default="/", metavar="PATH",
+                    help="for sites in a subfolder, e.g. /blog/ (default /)")
+    ap.add_argument("--keep-php-handler", action="store_true",
+                    help="with --reset-htaccess: keep the cPanel PHP-version block")
+    ap.add_argument("--fix-perms", action="store_true")
+    ap.add_argument("--debug", choices=["on", "off"],
+                    help="turn WordPress error logging (wp-content/debug.log) on or off; use with --diagnose")
+    ap.add_argument("--rebuild-config", action="store_true",
+                    help="rebuild a clean wp-config.php from the old settings (new security keys)")
+    ap.add_argument("--db-name"); ap.add_argument("--db-user"); ap.add_argument("--db-password")
+    ap.add_argument("--db-host"); ap.add_argument("--table-prefix")
+    ap.add_argument("--check-admin", action="store_true",
+                    help="read-only: check roles/permissions and list users (flags new accounts)")
+    ap.add_argument("--fix-admin", metavar="USER",
+                    help="give this user (login or ID) the administrator role and rebuild broken roles")
+    ap.add_argument("--disable-all-plugins", action="store_true")
+    ap.add_argument("--enable-all-plugins", action="store_true")
+    ap.add_argument("--disable-plugin", action="append", default=[], metavar="SLUG")
+    ap.add_argument("--disable-theme", action="append", default=[], metavar="SLUG")
+    ap.add_argument("--strip-conf", action="append", default=[], metavar="FILE")
+    ap.add_argument("--quarantine-file", action="append", default=[], metavar="FILE",
+                    help="move this file to quarantine right now (reversible with --undo-file)")
+    ap.add_argument("--list-quarantine", action="store_true")
+    ap.add_argument("--purge-quarantine", type=int, metavar="DAYS",
+                    help="permanently delete quarantine runs older than DAYS (asks first; add --yes to skip)")
+    ap.add_argument("--yes", action="store_true", help="do not ask for confirmation (for cron)")
+    ap.add_argument("--undo-file", metavar="PATH")
+    ap.add_argument("--undo-all", nargs="?", const="latest", metavar="RUN")
+    ap.add_argument("--exclude", action="append", default=[], metavar="PATH",
+                    help="skip this folder everywhere (e.g. --exclude bkp); repeatable")
+    ap.add_argument("--days", type=int, default=0, help="also list PHP files modified in the last N days")
+    ap.add_argument("--no-cjk", action="store_true", help="do not flag Chinese/Japanese/Korean characters")
+    ap.add_argument("--no-network", action="store_true", help="skip official checksum verification")
+    ap.add_argument("--quarantine-dir", default=None,
+                    help="where moved files go (default: wp_quarantine/ next to this script)")
+    ap.add_argument("--reports-dir", default=None,
+                    help="where logs/reports go (default: wp_reports/ next to this script)")
+    ap.add_argument("--version", action="version", version="tf_wp_cleanup " + __version__)
+    args = ap.parse_args()
+
+    if args.recover:
+        args.fix = args.reset_htaccess = args.fix_perms = args.diagnose = args.scan = True
+    try:
+        os.nice(10)  # be gentle with shared hosting
+    except (AttributeError, OSError):
+        pass
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    reports_dir = os.path.abspath(args.reports_dir) if args.reports_dir else REPORTS_DIR
+    qroot = args.quarantine_dir or os.path.join(QBASE, ts)
+    runs = list_runs(args.quarantine_dir)
+    ensure_private_dir(reports_dir)
+    ensure_private_dir(QBASE)
+    if any(part in WEB_DIR_NAMES for part in BASE_DIR.split(os.sep)):
+        say("[!] This tool lives inside a web-accessible folder (%s)." % BASE_DIR)
+        say("    Move it (and its wp_quarantine/wp_reports folders) outside public_html, e.g. ~/tf_tools/.")
+    if not args.list_quarantine:
+        try:
+            log_path = os.path.join(reports_dir, "run_%s.log" % ts)
+            log_fh = open(log_path, "w")
+            os.chmod(log_path, 0o600)
+            sys.stdout = Tee(sys.stdout, log_fh)
+            say("tf_wp_cleanup %s - run log: %s" % (__version__, log_path))
+        except OSError:
+            pass
+
+    # --- quarantine browsing / undo (no WordPress needed)
+    if args.list_quarantine:
+        list_quarantine(runs)
+        return 0
+    if args.purge_quarantine is not None:
+        purge_quarantine(args.purge_quarantine, args.yes)
+        return 0
+    if args.undo_file:
+        undo_file(args.undo_file, runs)
+        return 0
+    if args.undo_all:
+        undo_all(args.undo_all, runs)
+        return 0
+    if args.quarantine_file:
+        for f in args.quarantine_file:
+            f = os.path.abspath(f)
+            if os.path.isfile(f):
+                quarantine(f, qroot)
+                say("  quarantined: %s  (undo: --undo-file %s)" % (f, f))
+            else:
+                say("  not a file: %s" % f)
+        return 0
+    if args.strip_conf:
+        for f in args.strip_conf:
+            f = os.path.abspath(f)
+            n = strip_conf_lines(f, qroot) if os.path.isfile(f) else 0
+            say("  %s: removed %d auto_prepend/append line(s)%s" % (f, n, " (backup in %s/replaced)" % qroot if n else ""))
+        return 0
+
+    EXCLUDE[:] = [os.path.abspath(e) for e in args.exclude] + [BASE_DIR]   # never scan our own quarantine
+    roots = [os.path.abspath(r) for r in args.roots]
+    installs = find_installs(roots)
+    if not installs:
+        say("No WordPress install found in: %s" % ", ".join(roots))
+        say("cd into the site's root folder (the one containing wp-includes) and run again.")
+        return 1
+
+    tool_mode = any([bool(args.debug), args.rebuild_config, args.check_admin, bool(args.fix_admin), args.diagnose, args.reset_htaccess, args.fix_perms, args.disable_all_plugins,
+                     args.enable_all_plugins, args.disable_plugin, args.disable_theme])
+    do_scan = args.scan or not tool_mode
+    say("Found %d WordPress install(s)" % len(installs))
+
+    # --- quick manual switches first
+    for root in installs:
+        if args.disable_all_plugins:
+            disable_all_plugins(root)
+        if args.enable_all_plugins:
+            enable_all_plugins(root)
+        for s in args.disable_plugin:
+            disable_item(root, "plugins", s)
+        for s in args.disable_theme:
+            disable_item(root, "themes", s)
+
+    if args.debug:
+        for root in installs:
+            debug_mode(root, args.debug == "on", qroot)
+    if args.rebuild_config:
+        for root in installs:
+            say("\n== REBUILD wp-config.php for %s" % root)
+            rebuild_config(root, args, qroot, runs)
+    if args.check_admin or args.fix_admin:
+        for root in installs:
+            say("\n== ADMIN PERMISSIONS for %s" % root)
+            admin_tool(root, args.fix_admin, bool(args.fix_admin))
+        if args.fix_admin:
+            say("\nLog out, clear cookies (or use a private window) and log in again.")
+
+    # --- scan / fix
+    lines = []
+    if do_scan:
+        say("Mode: %s%s" % ("FIX" if args.fix else "DRY-RUN (nothing will be changed)",
+                              " + aggressive" if args.aggressive else ""))
+        findings, verified = {}, set()
+        for root in installs:
+            say("\n== %s" % root)
+            verify_core(root, findings, verified, not args.no_network)
+            verify_plugins(root, findings, verified, not args.no_network)
+            review_wp_content(root, findings)
+        for root in installs:
+            say("\n== scanning %s" % root)
+            generic_scan(root, installs, verified, findings, args)
+
+        say("\n================ FINDINGS ================")
+        for level in ("HIGH", "MED", "INFO"):
+            for path, f in sorted(findings.items()):
+                if f["level"] != level:
+                    continue
+                a = f["action"]
+                act = a[0] if isinstance(a, tuple) else (a or "review")
+                lines.append("[%s] %s\n      %s   -> %s" % (level, path, "; ".join(f["reasons"]), act))
+        say("\n".join(lines) if lines else "Nothing suspicious found.")
+
+        say("\n================ ACTIONS ================")
+        done, failed = apply_fixes(findings, args, qroot)
+        if args.fix:
+            say("\nDone: %d fixed, %d failed. Quarantined files / backups of replaced files: %s" % (done, failed, qroot))
+
+    # --- recovery tools
+    if args.reset_htaccess or args.fix_perms:
+        say("\n================ RECOVERY ================")
+        for root in installs:
+            if args.reset_htaccess:
+                reset_htaccess(root, qroot, args.rewrite_base, args.keep_php_handler)
+            if args.fix_perms:
+                fix_perms(root)
+
+    # --- diagnosis (after fixes, so it shows what is still wrong)
+    if args.diagnose:
+        for root in installs:
+            diagnose(root, list_runs(args.quarantine_dir))
+
+    if lines:
+        report = os.path.join(reports_dir, "report_%s.txt" % ts)
+        try:
+            with open(report, "w") as fh:
+                fh.write("tf_wp_cleanup %s report, %s\nScanned: %s\n\n" % (
+                    __version__, time.strftime("%Y-%m-%d %H:%M:%S"), ", ".join(installs)))
+                fh.write("\n".join(lines) + "\n")
+            os.chmod(report, 0o600)
+            say("\nFindings report saved to %s" % report)
+        except OSError:
+            pass
+    if args.recover:
+        say("\nNow load the site. Still broken? Run: {TOOL} --diagnose")
+        say("Then change ALL passwords (cPanel, FTP, DB, WordPress admins) and regenerate wp-config.php salts.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
