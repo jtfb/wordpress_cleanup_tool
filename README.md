@@ -1,5 +1,7 @@
 # tf_wp_cleanup
 
+Run it as: `tf_wp_cleanup`
+
 A single-file Python tool to **find, clean and recover hacked WordPress sites on shared hosting** (cPanel, SSH or the cPanel Terminal). It needs no installation and no extra Python packages.
 
 > **Read this first.** No scanner catches everything. This tool is careful by design (dry run by default, nothing is deleted, everything it changes can be undone), but you must **take a full backup before using `--fix` or `--recover`**. Use it at your own risk.
@@ -47,6 +49,8 @@ curl -O https://raw.githubusercontent.com/YOUR_GITHUB_USER/YOUR_REPO/main/tf_wp_
 python3 tf_wp_cleanup.py --version
 ```
 
+Then create the `tf_wp_cleanup` command as shown in *Quick start* below.
+
 Everything the tool writes goes **next to the script**:
 
 ```
@@ -56,28 +60,34 @@ Everything the tool writes goes **next to the script**:
 └── wp_quarantine/    one folder per run: moved files + backups of replaced files
 ```
 
-Use `--reports-dir` and `--quarantine-dir` to choose other locations.
+The command works through a link, but the reports and quarantine always stay next to the real script. Use `--reports-dir` and `--quarantine-dir` to choose other locations.
 
 ## Quick start for non-technical users
 
 Run the tool **from the site's own folder** (the one that contains `wp-config.php`, `wp-admin` and `wp-includes`). It only looks at the folder you are standing in and everything below it.
 
-**One-time setup:** create a short command called `wpclean` (copy and paste both lines):
+**One-time setup:** create the `tf_wp_cleanup` command (copy and paste, one block):
 
 ```bash
-echo "alias wpclean='python3 ~/tf_tools/cleanup_wp/tf_wp_cleanup.py'" >> ~/.bashrc
+chmod +x ~/tf_tools/cleanup_wp/tf_wp_cleanup.py
+mkdir -p ~/bin
+ln -sf ~/tf_tools/cleanup_wp/tf_wp_cleanup.py ~/bin/tf_wp_cleanup
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
+tf_wp_cleanup --version
 ```
+
+From now on the tool is simply **`tf_wp_cleanup`**. If the last line prints the version, you're done. (If the command is not found, you can always run the same thing with the full form: `python3 ~/tf_tools/cleanup_wp/tf_wp_cleanup.py`.)
 
 **Every time you check a site:**
 
 ```bash
 cd ~/public_html/yoursite     # 1. go to the site folder
-wpclean                       # 2. scan only - changes nothing
+tf_wp_cleanup                       # 2. scan only - changes nothing
                               # 3. read the result (see "Reading the result" below)
-wpclean --fix                 # 4. apply the safe fixes (backup first!)
-wpclean                       # 5. scan again: you want "Nothing suspicious found."
-wpclean --diagnose            # 6. if the site shows an error, find out why
+tf_wp_cleanup --fix                 # 4. apply the safe fixes (backup first!)
+tf_wp_cleanup                       # 5. scan again: you want "Nothing suspicious found."
+tf_wp_cleanup --diagnose            # 6. if the site shows an error, find out why
 ```
 
 Check every site **after any suspicious event** (strange pages, Google warnings, hosting abuse emails, a plugin you didn't install) and at least **once a month**.
@@ -85,7 +95,7 @@ Check every site **after any suspicious event** (strange pages, Google warnings,
 **Several sites in one account?** Scan them all, read-only:
 
 ```bash
-for d in ~/public_html/*/; do (cd "$d" && [ -f wp-config.php ] && wpclean); done
+for d in ~/public_html/*/; do (cd "$d" && [ -f wp-config.php ] && tf_wp_cleanup); done
 ```
 
 **Reading the result:**
@@ -99,10 +109,10 @@ for d in ~/public_html/*/; do (cd "$d" && [ -f wp-config.php ] && wpclean); done
 
 ```bash
 cd ~/public_html/yoursite
-wpclean --recover
+tf_wp_cleanup --recover
 ```
 
-`--recover` = `--fix` + `--htaccess` + `--fix-perms` + `--diagnose`. Add `--aggressive` to also quarantine unknown PHP files in plugins and in the site root: `wpclean --recover --aggressive`.
+`--recover` = `--fix` + `--htaccess` + `--fix-perms` + `--diagnose`. Add `--aggressive` to also quarantine unknown PHP files in plugins and in the site root: `tf_wp_cleanup --recover --aggressive`.
 
 ## Commands
 
@@ -148,35 +158,35 @@ wpclean --recover
 
 **The site shows a 500 error or "critical error"**
 ```bash
-wpclean --diagnose                 # names the file / plugin / theme
-wpclean --disable-plugin SLUG      # if it points to a plugin (or --disable-theme)
-wpclean --htaccess                 # if the log shows nothing
-wpclean --fix-perms
+tf_wp_cleanup --diagnose                 # names the file / plugin / theme
+tf_wp_cleanup --disable-plugin SLUG      # if it points to a plugin (or --disable-theme)
+tf_wp_cleanup --htaccess                 # if the log shows nothing
+tf_wp_cleanup --fix-perms
 ```
 Also check the PHP version in cPanel > **MultiPHP Manager**: old plugins often crash on PHP 8.
 
 **I can't edit pages or my admin has no permissions**
 ```bash
-wpclean --check-admin
-wpclean --fix-admin YOUR_USERNAME
+tf_wp_cleanup --check-admin
+tf_wp_cleanup --fix-admin YOUR_USERNAME
 ```
 A **403 Forbidden** is a different problem (server rules, a security plugin, ModSecurity or a leftover `.htaccess`), not a WordPress permission.
 
 **`wp-config.php` is missing or infected**
 ```bash
-wpclean --rebuild-config
+tf_wp_cleanup --rebuild-config
 ```
 Check the values it prints (especially `WP_HOME`, `WP_SITEURL` and `DB_HOST`) and review the list of settings it did not copy.
 
 **I need something back that the tool moved**
 ```bash
-wpclean --list-quarantine
-wpclean --undo-file /home/YOUR_USER/public_html/yoursite/path/to/file.php
+tf_wp_cleanup --list-quarantine
+tf_wp_cleanup --undo-file /home/YOUR_USER/public_html/yoursite/path/to/file.php
 ```
 
 ## Scheduling (optional)
 
-In cPanel > **Cron Jobs**. Use your real home path:
+In cPanel > **Cron Jobs**. Cron does not load your shortcuts, so use the full `python3 /home/YOUR_USER/...` form with your real home path:
 
 ```
 # weekly read-only scan of one site (reports are saved in wp_reports/)
