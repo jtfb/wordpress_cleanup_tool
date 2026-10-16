@@ -42,8 +42,8 @@ A single-file Python tool to **find, clean and recover hacked WordPress sites on
 Put the script in a folder **outside your websites** (never inside `public_html`):
 
 ```bash
-mkdir -p ~/tf_tools/cleanup_wp
-cd ~/tf_tools/cleanup_wp
+mkdir -p ~/tf_tools/tf_cleanup_wp
+cd ~/tf_tools/tf_cleanup_wp
 # either upload tf_wp_cleanup.py with cPanel File Manager, or:
 curl -O https://raw.githubusercontent.com/YOUR_GITHUB_USER/YOUR_REPO/main/tf_wp_cleanup.py
 python3 tf_wp_cleanup.py --version
@@ -54,10 +54,10 @@ Then create the `tf_wp_cleanup` command as shown in *Quick start* below.
 Everything the tool writes goes **next to the script**:
 
 ```
-~/tf_tools/cleanup_wp/
+~/tf_tools/tf_cleanup_wp/
 ├── tf_wp_cleanup.py
-├── wp_reports/       run logs (run_<date>.log) and findings reports (report_<date>.txt)
-└── wp_quarantine/    one folder per run: moved files + backups of replaced files
+├── tf_wp_reports/       run logs (run_<date>.log) and findings reports (report_<date>.txt)
+└── tf_wp_quarantine/    one folder per run: moved files + backups of replaced files
 ```
 
 The command works through a link, but the reports and quarantine always stay next to the real script. Use `--reports-dir` and `--quarantine-dir` to choose other locations.
@@ -69,15 +69,15 @@ Run the tool **from the site's own folder** (the one that contains `wp-config.ph
 **One-time setup:** create the `tf_wp_cleanup` command (copy and paste, one block):
 
 ```bash
-chmod +x ~/tf_tools/cleanup_wp/tf_wp_cleanup.py
+chmod +x ~/tf_tools/tf_cleanup_wp/tf_wp_cleanup.py
 mkdir -p ~/bin
-ln -sf ~/tf_tools/cleanup_wp/tf_wp_cleanup.py ~/bin/tf_wp_cleanup
+ln -sf ~/tf_tools/tf_cleanup_wp/tf_wp_cleanup.py ~/bin/tf_wp_cleanup
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 tf_wp_cleanup --version
 ```
 
-From now on the tool is simply **`tf_wp_cleanup`**. If the last line prints the version, you're done. (If the command is not found, you can always run the same thing with the full form: `python3 ~/tf_tools/cleanup_wp/tf_wp_cleanup.py`.)
+From now on the tool is simply **`tf_wp_cleanup`**. If the last line prints the version, you're done. (If the command is not found, you can always run the same thing with the full form: `python3 ~/tf_tools/tf_cleanup_wp/tf_wp_cleanup.py`.)
 
 **Every time you check a site:**
 
@@ -189,11 +189,11 @@ tf_wp_cleanup --undo-file /home/YOUR_USER/public_html/yoursite/path/to/file.php
 In cPanel > **Cron Jobs**. Cron does not load your shortcuts, so use the full `python3 /home/YOUR_USER/...` form with your real home path:
 
 ```
-# weekly read-only scan of one site (reports are saved in wp_reports/)
-0 3 * * 1  cd /home/YOUR_USER/public_html/yoursite && python3 /home/YOUR_USER/tf_tools/cleanup_wp/tf_wp_cleanup.py >/dev/null 2>&1
+# weekly read-only scan of one site (reports are saved in tf_wp_reports/)
+0 3 * * 1  cd /home/YOUR_USER/public_html/yoursite && python3 /home/YOUR_USER/tf_tools/tf_cleanup_wp/tf_wp_cleanup.py >/dev/null 2>&1
 
 # daily cleanup of quarantine runs older than 30 days
-0 4 * * *  python3 /home/YOUR_USER/tf_tools/cleanup_wp/tf_wp_cleanup.py --purge-quarantine 30 --yes >/dev/null 2>&1
+0 4 * * *  python3 /home/YOUR_USER/tf_tools/tf_cleanup_wp/tf_wp_cleanup.py --purge-quarantine 30 --yes >/dev/null 2>&1
 ```
 
 Don't schedule `--fix` or `--fix-admin` unattended.
@@ -207,6 +207,17 @@ Don't schedule `--fix` or `--fix-admin` unattended.
 5. Look for old backups or copies of the site inside `public_html` (such as `bkp/`): they are often infected and reachable from the web. Delete them or move them out.
 6. Ask your host whether a server-side malware scanner is available.
 7. Keep regular off-site backups.
+
+## Upgrading / moving the tool
+
+If you move the tool to a new folder, move its output folders with it, otherwise `--list-quarantine` and `--undo-file` will not see older runs:
+
+```bash
+mv OLD_FOLDER/tf_wp_quarantine/* ~/tf_tools/tf_cleanup_wp/tf_wp_quarantine/
+mv OLD_FOLDER/tf_wp_reports/*    ~/tf_tools/tf_cleanup_wp/tf_wp_reports/
+```
+
+Then re-run the `ln -sf ...` line from *Quick start* so the `tf_wp_cleanup` command points at the new location.
 
 ## Limitations
 
