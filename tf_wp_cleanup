@@ -27,10 +27,12 @@ Recovery tools (each acts immediately and is reversible):
     --rebuild-config            rebuild a clean wp-config.php from the old settings (--db-name/--db-user/
                                 --db-password/--db-host/--table-prefix if the old one is gone)
     --debug on|off              log PHP errors to wp-content/debug.log, then read them with --diagnose
+    --check-site URL            test the site from outside: REST API, redirects, login (why the editor can't save)
     --check-admin               read-only: check admin roles, list users (flags accounts made recently)
     --fix-admin USER            give USER (login or ID) the administrator role; rebuilds broken roles
     --fix-perms                 dirs 755, files 644, wp-config.php 600
     --disable-all-plugins       rename wp-content/plugins -> plugins.disabled   (--enable-all-plugins undoes)
+    --disable-fatal-plugins     disable every plugin that caused a PHP fatal error in the logs (--fatal-days N)
     --disable-plugin SLUG       rename one plugin folder to SLUG.disabled (rename back to undo)
     --disable-theme SLUG        same for a theme
     --quarantine-file FILE      move one file to quarantine (repeatable)
@@ -43,8 +45,11 @@ Undo anything the script moved/replaced (nothing is ever deleted):
     --undo-all [RUN]                   put back everything from a run (this also brings malware back!)
 """
 import argparse
+import calendar
 import hashlib
 import io
+import calendar
+import datetime
 import glob
 import json
 import os
@@ -56,6 +61,8 @@ import string
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -1027,7 +1034,83 @@ def debug_mode(root, on, qroot):
         say("  debug logging OFF for %s (original settings restored)" % root)
 
 
-# ---------------------------------------------------------------- diagnosis
+def fetch_url(url, timeout=25):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; tf_wp_cleanup)"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.getcode(), r.headers.get("Content-Type", ""), r.read(200000).decode("utf-8", "ignore"), r.geturl(), None
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(200000).decode("utf-8", "ignore")
+        except Exception:
+            body = ""
+        return e.code, (e.headers.get("Content-Type", "") if e.headers else ""), body, url, None
+    except Exception as e:
+        return None, "", "", url, str(e)
+
+
+def is_wp_json(body):
+    try:
+        j = json.loads(body)
+        return isinstance(j, dict) and ("namespaces" in j or "routes" in j)
+    except ValueError:
+        return False
+
+
+def check_site(url):
+    """Test what the block editor needs from outside: the REST API, redirects, login and ajax."""
+    base = url.strip().rstrip("/")
+    if not re.match(r"^https?://", base, re.I):
+        base = "https://" + base
+    say("\n== SITE CHECK for %s (what a visitor / the block editor sees)" % base)
+    res = {}
+    tests = (("home", "Home page", "/"), ("rest", "REST API /wp-json/", "/wp-json/"),
+             ("rest2", "REST API ?rest_route=/", "/?rest_route=/"), ("login", "Login page", "/wp-login.php"),
+             ("ajax", "admin-ajax.php", "/wp-admin/admin-ajax.php"))
+    for key, label, path in tests:
+        code, ctype, body, final, err = fetch_url(base + path)
+        res[key] = (code, ctype, body, final, err)
+        if err:
+            say("  [FAIL] %-24s %s" % (label, err))
+            continue
+        moved = ""
+        a, b = urllib.parse.urlparse(base + path), urllib.parse.urlparse(final)
+        if (a.scheme, a.netloc) != (b.scheme, b.netloc):
+            moved = "  -> redirected to %s://%s" % (b.scheme, b.netloc)
+        say("  [%s] %-24s HTTP %s  %s%s" % ("OK  " if code < 400 else "FAIL", label, code, ctype.split(";")[0], moved))
+    code, ctype, body, final, err = res["rest"]
+    code2, _, body2, _, _ = res["rest2"]
+    say("")
+    if code == 200 and is_wp_json(body):
+        say("  REST API works. The block editor can talk to the server, so look at plugin/theme errors: --debug on, then --diagnose.")
+    elif code2 == 200 and is_wp_json(body2):
+        say("  [!] The REST API only works in the '?rest_route=' form: permalinks / .htaccess problem.")
+        say("      Fix: {TOOL} --htaccess  then WordPress > Settings > Permalinks > Save.")
+    elif code == 403:
+        say("  [!] REST API is BLOCKED (403). The editor cannot save pages. Common causes: ModSecurity/firewall (cPanel > Security),")
+        say("      a security plugin, a leftover rule in .htaccess (try --htaccess; check subfolder .htaccess files), a blocked IP.")
+    elif code == 404:
+        say("  [!] REST API not found (404): .htaccess / permalinks. Fix: {TOOL} --htaccess then Settings > Permalinks > Save.")
+    elif code and code >= 500:
+        say("  [!] The server crashes (HTTP %s) on a basic WordPress request: run {TOOL} --diagnose." % code)
+    elif code == 200:
+        say("  [!] /wp-json/ returned something that is not JSON (a plugin/theme printing text before the output, or a redirect page).")
+        say("      Starts with: %s" % snippet(body)[:100])
+        say("      Try: {TOOL} --disable-all-plugins, then test again.")
+    else:
+        say("  [!] Could not reach the site (%s). Check the address, DNS and SSL certificate." % (err or "no response"))
+    h, f = urllib.parse.urlparse(base), urllib.parse.urlparse(res["home"][3] or base)
+    if res["home"][0] and (h.scheme, h.netloc) != (f.scheme, f.netloc):
+        say("  [!] The site redirects %s -> %s. Log in using exactly that address, and make sure WordPress Address / Site Address" % (h.netloc, f.netloc))
+        say("      (Settings > General) use it too; a mismatch makes the editor's save requests fail.")
+
+
+LOG_SPLIT = re.compile(r"(?m)^(?=\[\d{1,2}-[A-Za-z]{3}-\d{4} \d\d:\d\d:\d\d)")
+LOG_TIME = re.compile(r"^\[(\d{1,2}-[A-Za-z]{3}-\d{4} \d\d:\d\d:\d\d)(?: ([^\]]+))?\]")
+OWN_SCRIPT = re.compile(r"/\.[A-Za-z_]*admin_\d+\.php")     # temp script of --check-admin: never blame a plugin for it
+PLUGIN_PATH = re.compile(r"/wp-content/plugins/([^/\s:]+)/")
+
+
 def tail(path, n=300000):
     try:
         with open(path, "rb") as fh:
@@ -1054,6 +1137,108 @@ def ancestor_dirs(root):
             break
         out.append(d)
     return out
+
+
+def error_log_files(root):
+    """Every PHP/WordPress error log we know how to find for this install."""
+    wc = os.path.join(root, "wp-content")
+    logs = [os.path.join(root, "error_log"), os.path.join(root, "php_errorlog"),
+            os.path.join(root, "wp-admin", "error_log"), os.path.join(root, "wp-includes", "error_log"),
+            os.path.join(wc, "debug.log"), os.path.join(wc, "error_log")]
+    for sub in ("plugins", "themes"):
+        base = os.path.join(wc, sub)
+        if os.path.isdir(base):
+            logs.append(os.path.join(base, "error_log"))
+            logs += [os.path.join(base, x, "error_log") for x in os.listdir(base)]
+    return [l for l in dict.fromkeys(logs) if os.path.isfile(l)]
+
+
+def log_entries(path, max_bytes=3000000):
+    """Split a log into entries (a stack trace stays with its error line)."""
+    return [e for e in LOG_SPLIT.split(tail(path, max_bytes)) if e.strip()]
+
+
+def entry_time(entry):
+    m = LOG_TIME.match(entry)
+    if not m:
+        return None
+    try:
+        return calendar.timegm(time.strptime(m.group(1), "%d-%b-%Y %H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def plugin_slug_of(path, root):
+    kind, slug = owner_of(path, root)
+    if kind == "plugins":
+        return slug
+    m = re.search(r"/wp-content/plugins/([^/\s:]+)/", path)
+    return m.group(1) if m else None
+
+
+def newest_mtime(folder):
+    best = 0
+    for p, _ in walk(folder):
+        try:
+            best = max(best, os.path.getmtime(p))
+        except OSError:
+            pass
+    return best
+
+
+def fatal_plugins(root, days=14):
+    """{slug: info} for plugins that are the source of a PHP fatal/parse error in the logs."""
+    cutoff = time.time() - days * 86400 if days else 0
+    pdir = os.path.join(root, "wp-content", "plugins")
+    found = {}
+    for lg in error_log_files(root):
+        for ent in log_entries(lg):
+            if OWN_SCRIPT.search(ent):          # caused by this tool's own check script, not by a plugin
+                continue
+            first = ent.split("\n", 1)[0]
+            m = FATAL_RX.search(first)
+            if m:
+                path = m.group(2)
+            elif re.search(r"PHP (Fatal|Parse) error", first, re.I):
+                t = re.search(r"thrown in (/[^\s:]+\.php)", ent)
+                path = t.group(1) if t else None
+            else:
+                path = None
+            if not path:
+                continue
+            ts = entry_time(ent)
+            if ts is not None and ts < cutoff:
+                continue
+            slug = plugin_slug_of(path, root)
+            if not slug:                       # thrown inside WordPress core: blame the first plugin in the stack trace
+                for frame in re.findall(r"#\d+ (/\S+?\.php)", ent):
+                    slug = plugin_slug_of(frame, root)
+                    if slug:
+                        path = frame
+                        break
+            if not slug or not os.path.isdir(os.path.join(pdir, slug)):
+                continue
+            if ts and ts < newest_mtime(os.path.join(pdir, slug)):   # plugin was updated after this error
+                continue
+            old = found.get(slug)
+            if old is None or (ts or 0) > old["ts"]:
+                when = first[1:first.index("]")] if first.startswith("[") and "]" in first else "unknown date"
+                found[slug] = {"ts": ts or 0, "when": when, "msg": re.sub(r"^\[[^\]]*\]\s*", "", snippet(first)),
+                               "file": path, "log": lg}
+    return found
+
+
+def disable_fatal_plugins(root, days=14):
+    """Rename (never delete) every plugin that crashed with a PHP fatal error: SLUG -> SLUG.disabled."""
+    found = fatal_plugins(root, days)
+    if not found:
+        say("  no plugin with a fatal error in the logs (last %s)" % ("%d days" % days if days else "whole log"))
+        return []
+    for slug, info in sorted(found.items()):
+        say("  plugin '%s' crashed (%s): %s" % (slug, info["when"], info["msg"][:140]))
+        disable_item(root, "plugins", slug)
+    say("  Re-test the site. To bring one back: rename wp-content/plugins/SLUG.disabled to SLUG and re-activate it in wp-admin.")
+    return sorted(found)
 
 
 def diagnose(root, runs):
@@ -1100,18 +1285,15 @@ def diagnose(root, runs):
     if ww:
         say("  [!] %d world-writable files/folders (777/666) - hosts often answer these with 500 -> --fix-perms" % ww)
         problems += 1
-    # error logs
-    logs = [os.path.join(root, "error_log"), os.path.join(root, "wp-admin", "error_log"),
-            os.path.join(root, "wp-content", "debug.log"), os.path.join(root, "wp-content", "error_log")]
-    for sub in ("plugins", "themes"):
-        base = os.path.join(root, "wp-content", sub)
-        if os.path.isdir(base):
-            logs += [os.path.join(base, x, "error_log") for x in os.listdir(base)]
+    logs = error_log_files(root)
     seen, errors = set(), []
     for lg in logs:
         if not os.path.isfile(lg):
             continue
-        for line in reversed(tail(lg).splitlines()):
+        for ent in reversed(log_entries(lg)):
+            if OWN_SCRIPT.search(ent):
+                continue
+            line = ent.split("\n", 1)[0]
             m = FATAL_RX.search(line)
             if not m:
                 continue
@@ -1126,6 +1308,11 @@ def diagnose(root, runs):
     if errors:
         say("  Recent fatal errors (newest first):")
     for lg, line, f, req in errors:
+        kind0, slug0 = owner_of(f, root)
+        if kind0 and os.path.isdir(os.path.join(root, "wp-content", kind0, slug0 + ".disabled")) \
+                and not os.path.isdir(os.path.join(root, "wp-content", kind0, slug0)):
+            say("  [ok] older error from %s '%s', already disabled (%s.disabled): %s" % (kind0[:-1], slug0, slug0, line[:90]))
+            continue
         problems += 1
         say("  [!] %s" % re.sub(r"\s*\(include_path='[^']*'\)", "", line)[:330])
         for target in [x for x in (req, f) if x]:
@@ -1140,6 +1327,11 @@ def diagnose(root, runs):
         if kind:
             flag = "--disable-plugin" if kind == "plugins" else "--disable-theme"
             say("      belongs to %s '%s' -> try: {TOOL} %s %s" % (kind[:-1], slug, flag, slug))
+    blamed = fatal_plugins(root, 30)
+    if blamed:
+        problems += 1
+        say("  [!] Plugins with fatal errors in the last 30 days: %s" % ", ".join(sorted(blamed)))
+        say("      fix: {TOOL} --disable-fatal-plugins")
     if not errors:
         say("  No fatal errors found in error logs (logs may be elsewhere: cPanel > Metrics > Errors).")
     if not problems:
@@ -1165,6 +1357,8 @@ def main():
     ap.add_argument("--keep-php-handler", action="store_true",
                     help="with --reset-htaccess: keep the cPanel PHP-version block")
     ap.add_argument("--fix-perms", action="store_true")
+    ap.add_argument("--check-site", metavar="URL",
+                    help="test the site from outside (REST API, redirects, login) - the usual reason the editor cannot save")
     ap.add_argument("--debug", choices=["on", "off"],
                     help="turn WordPress error logging (wp-content/debug.log) on or off; use with --diagnose")
     ap.add_argument("--rebuild-config", action="store_true",
@@ -1178,6 +1372,10 @@ def main():
     ap.add_argument("--disable-all-plugins", action="store_true")
     ap.add_argument("--enable-all-plugins", action="store_true")
     ap.add_argument("--disable-plugin", action="append", default=[], metavar="SLUG")
+    ap.add_argument("--disable-fatal-plugins", action="store_true",
+                    help="disable every plugin that caused a PHP fatal error in the error logs (see --fatal-days)")
+    ap.add_argument("--fatal-days", type=int, default=14, metavar="N",
+                    help="only use log entries from the last N days (default 14; 0 = whole log)")
     ap.add_argument("--disable-theme", action="append", default=[], metavar="SLUG")
     ap.add_argument("--strip-conf", action="append", default=[], metavar="FILE")
     ap.add_argument("--quarantine-file", action="append", default=[], metavar="FILE",
@@ -1202,6 +1400,7 @@ def main():
 
     if args.recover:
         args.fix = args.reset_htaccess = args.fix_perms = args.diagnose = args.scan = True
+        args.disable_fatal_plugins = True
     try:
         os.nice(10)  # be gentle with shared hosting
     except (AttributeError, OSError):
@@ -1248,6 +1447,9 @@ def main():
             else:
                 say("  not a file: %s" % f)
         return 0
+    if args.check_site:
+        check_site(args.check_site)
+        return 0
     if args.strip_conf:
         for f in args.strip_conf:
             f = os.path.abspath(f)
@@ -1263,7 +1465,7 @@ def main():
         say("cd into the site's root folder (the one containing wp-includes) and run again.")
         return 1
 
-    tool_mode = any([bool(args.debug), args.rebuild_config, args.check_admin, bool(args.fix_admin), args.diagnose, args.reset_htaccess, args.fix_perms, args.disable_all_plugins,
+    tool_mode = any([args.disable_fatal_plugins, bool(args.debug), args.rebuild_config, args.check_admin, bool(args.fix_admin), args.diagnose, args.reset_htaccess, args.fix_perms, args.disable_all_plugins,
                      args.enable_all_plugins, args.disable_plugin, args.disable_theme])
     do_scan = args.scan or not tool_mode
     say("Found %d WordPress install(s)" % len(installs))
@@ -1304,6 +1506,10 @@ def main():
             verify_core(root, findings, verified, not args.no_network)
             verify_plugins(root, findings, verified, not args.no_network)
             review_wp_content(root, findings)
+            for slug, info in fatal_plugins(root, args.fatal_days).items():
+                add(findings, os.path.join(root, "wp-content", "plugins", slug), "HIGH",
+                    "plugin crashed with a PHP fatal error (%s): %s  [--fix or --disable-fatal-plugins disables it]" % (
+                        info["when"], info["msg"][:100]))
         for root in installs:
             say("\n== scanning %s" % root)
             generic_scan(root, installs, verified, findings, args)
@@ -1322,6 +1528,13 @@ def main():
         done, failed = apply_fixes(findings, args, qroot)
         if args.fix:
             say("\nDone: %d fixed, %d failed. Quarantined files / backups of replaced files: %s" % (done, failed, qroot))
+
+    # --- plugins that crash with a PHP fatal error (explicit flag, --fix or --recover)
+    if args.disable_fatal_plugins or (args.fix and do_scan):
+        for root in installs:
+            say("\n== PLUGINS WITH FATAL ERRORS in %s (error logs, last %s)" % (
+                root, "%d days" % args.fatal_days if args.fatal_days else "whole log"))
+            disable_fatal_plugins(root, args.fatal_days)
 
     # --- recovery tools
     if args.reset_htaccess or args.fix_perms:
