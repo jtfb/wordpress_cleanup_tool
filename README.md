@@ -112,7 +112,7 @@ cd ~/public_html/yoursite
 tf_wp_cleanup --recover
 ```
 
-`--recover` = `--fix` + `--htaccess` + `--fix-perms` + `--diagnose`. Add `--aggressive` to also quarantine unknown PHP files in plugins and in the site root: `tf_wp_cleanup --recover --aggressive`.
+`--recover` = `--fix` (including disabling plugins that crash) + `--htaccess` + `--fix-perms` + `--diagnose`. Add `--aggressive` to also quarantine unknown PHP files in plugins and in the site root: `tf_wp_cleanup --recover --aggressive`.
 
 ## Commands
 
@@ -121,7 +121,7 @@ tf_wp_cleanup --recover
 | Command | What it does |
 |---|---|
 | *(no options)* | Scan, report only |
-| `--fix` | Apply safe fixes: restore core/plugin files, quarantine PHP in uploads and unknown PHP in core folders, strip `auto_prepend_file` lines |
+| `--fix` | Apply safe fixes: restore core/plugin files, quarantine PHP in uploads and unknown PHP in core folders, strip `auto_prepend_file` lines, disable plugins that crash with a PHP fatal error |
 | `--aggressive` | With `--fix`: also quarantine unknown PHP in plugins, unknown PHP in the site root, and files with high-confidence malware signatures |
 | `--recover` | Everything needed to get a site back online (see above) |
 | `--days N` | Also list PHP files changed in the last N days |
@@ -139,6 +139,8 @@ tf_wp_cleanup --recover
 | `--fix-perms` | Folders 755, files 644, `wp-config.php` 600 |
 | `--disable-all-plugins` / `--enable-all-plugins` | Rename `wp-content/plugins` to `plugins.disabled` and back |
 | `--disable-plugin SLUG` / `--disable-theme SLUG` | Rename one plugin/theme folder to `SLUG.disabled` |
+| `--disable-fatal-plugins` | Read the error logs (`error_log`, `wp-content/debug.log`, ...) and disable **every plugin that caused a PHP fatal error** (renamed to `SLUG.disabled`, never deleted). `--fatal-days N` sets how far back to look (default 14, `0` = whole log). When the error is thrown inside WordPress core, the plugin that appears in the stack trace is blamed. Errors older than the plugin's last update, and errors caused by the tool's own checks, are ignored. Also runs automatically with `--fix` and `--recover` |
+| `--check-site URL` | Test the site from outside: REST API, redirects, login. The usual reason the page editor cannot save |
 | `--rebuild-config` | Rebuild a clean `wp-config.php` (keeps DB settings, new security keys). If the old file is gone: `--db-name --db-user --db-password --db-host --table-prefix` |
 | `--check-admin` | Read-only: administrator role, table prefix, user list (new accounts flagged) |
 | `--fix-admin USER` | Make this user (login or ID) an administrator and repair a broken role |
@@ -171,6 +173,16 @@ tf_wp_cleanup --check-admin
 tf_wp_cleanup --fix-admin YOUR_USERNAME
 ```
 A **403 Forbidden** is a different problem (server rules, a security plugin, ModSecurity or a leftover `.htaccess`), not a WordPress permission.
+
+**I can't edit or create pages (but I am an administrator)**
+```bash
+tf_wp_cleanup --disable-fatal-plugins              # disables plugins that crash in the error logs
+tf_wp_cleanup --check-site https://yourdomain.com  # is the REST API (needed by the editor) reachable?
+tf_wp_cleanup --debug on                           # then open the editor once...
+tf_wp_cleanup --diagnose                           # ...and read the real error
+tf_wp_cleanup --debug off
+```
+Typical causes: a plugin that crashes on newer PHP versions, the REST API blocked (403) by a firewall/security plugin/`.htaccess`, or the site redirecting between `http`/`https` or `www`/non-`www`.
 
 **`wp-config.php` is missing or infected**
 ```bash
